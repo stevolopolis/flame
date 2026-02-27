@@ -19,6 +19,7 @@ dist
 exp
 results
 wandb
+slurm
 *.csv
 *.png
 *.html
