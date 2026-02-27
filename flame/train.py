@@ -29,7 +29,9 @@ from torchtitan.tools.logging import init_logger, logger
 from torchtitan.tools.profiling import maybe_enable_memory_snapshot, maybe_enable_profiling
 from transformers import AutoConfig, AutoModelForCausalLM, AutoTokenizer
 
-import custom_models
+from custom_models import (
+    lact_model
+)
 from flame.components.checkpoint import TrainState
 from flame.config_manager import JobConfig
 from flame.data import build_dataloader, build_dataset
@@ -149,6 +151,9 @@ def main(job_config: JobConfig):
     logger.info(
         f"Loading dataset {job_config.training.dataset}"
         f":{job_config.training.dataset_name}"
+        f":{job_config.training.dataset_split}"
+        f":{job_config.training.data_dir}"
+        f":{job_config.training.data_files}"
         if job_config.training.dataset_name is not None
         else ""
     )
