@@ -37,7 +37,7 @@ class LaCTSWIGLUConfig(PretrainedConfig):
         lr_parameterization: str = "mamba",
         learnable_ttt_scale: bool = True,
         use_momentum: bool = True,
-        ttt_loss_type: str = "dot_product",  # "l2"
+        ttt_loss_type: str = "dot_product",  # "dot_product" or "delta_rule"
         ttt_prenorm: bool = True,  # pre-norm or post-norm for ttt.
         # prenorm ttt:  state = state + f(norm(state))
         # postnorm ttt:  state = norm(state + f(state)
@@ -65,6 +65,11 @@ class LaCTSWIGLUConfig(PretrainedConfig):
         fw_init_gain: float = 0.5,
         use_fused_kernel: bool = False,  # use triton kernel for ttt implementation
         fp32_states: bool = False,  # whether to keep the fast weights in fp32
+        # W init regularization
+        w_init_regs: list[float] = None,
+        reg_to_zero: bool = False,
+        linearize_ttt: bool = False,
+        remove_norm: bool = False,
         **kwargs,
     ):
         self.hidden_size = hidden_size
@@ -108,6 +113,10 @@ class LaCTSWIGLUConfig(PretrainedConfig):
         self.fw_init_gain = fw_init_gain
         self.use_fused_kernel = use_fused_kernel
         self.fp32_states = fp32_states
+        self.w_init_regs = w_init_regs
+        self.reg_to_zero = reg_to_zero
+        self.linearize_ttt = linearize_ttt
+        self.remove_norm = remove_norm
         super().__init__(
             pad_token_id=pad_token_id,
             bos_token_id=bos_token_id,

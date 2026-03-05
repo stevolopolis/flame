@@ -147,6 +147,10 @@ class LaCTSWIGLULayer(nn.Module):
         fw_init_gain: float = 0.5,  # init the fast weights
         use_fused_kernel: bool = False,
         fp32_states: bool = False,
+        w_init_regs: list[float] = None,
+        reg_to_zero: bool = False,
+        linearize_ttt: bool = False,
+        remove_norm: bool = False,
     ):
         super().__init__()
 
@@ -180,6 +184,22 @@ class LaCTSWIGLULayer(nn.Module):
         self.no_v_silu = no_v_silu
         self.ttt_prenorm = ttt_prenorm
         self.ttt_nope = ttt_nope
+        self.w0_init_reg = w_init_regs[0] if w_init_regs is not None else None
+        self.w1_init_reg = w_init_regs[1] if w_init_regs is not None else None
+        self.w2_init_reg = w_init_regs[2] if w_init_regs is not None else None  
+        self.reg_to_zero = reg_to_zero
+        self.linearize_ttt = linearize_ttt
+        self.remove_norm = remove_norm
+
+        print(f"ttt_prenorm: {self.ttt_prenorm}")
+        print(f"w_init_regs: {w_init_regs}")
+        print(f"reg_to_zero: {self.reg_to_zero}")
+        print(f"ttt_linear: {self.linearize_ttt}")
+        print(f"remove_norm: {self.remove_norm}")
+
+        print(f"w0_init_reg: {self.w0_init_reg}, w1_init_reg: {self.w1_init_reg}, w2_init_reg: {self.w2_init_reg}")
+
+        assert not (w_init_regs is not None and use_fused_kernel), "Fused kernel does not support W init regularization yet."
 
         d_in, d_out = self.fw_head_dim, self.fw_head_dim
         d_h = int(d_in * inter_multi)
@@ -224,6 +244,11 @@ class LaCTSWIGLULayer(nn.Module):
         #### Per-Token LR parameterization.
         self.lr_dim = int(lr_dim * 3 * self.num_fw_heads)
         self.lr_proj = nn.Linear(self.hidden_size, self.lr_dim)
+        if w_init_regs == [None, None, None]:
+            print("Using learnable w-init regularization scalars for fast weights")
+            self.reg_lr_proj = nn.Linear(self.hidden_size, self.lr_dim)
+        else:
+            self.reg_lr_proj = None
         base_lr = 0.001
         # Lr parameterization and initialization
         if lr_parameterization.lower() == "mamba":
@@ -253,7 +278,8 @@ class LaCTSWIGLULayer(nn.Module):
         self.fp32_states = fp32_states
 
         assert self.ttt_loss_type in [
-            "dot_product"
+            "dot_product",
+            "delta_rule",
         ], f"Loss type {self.ttt_loss_type} not supported"
 
     def _rescale_qk(self, q, k):
@@ -265,8 +291,8 @@ class LaCTSWIGLULayer(nn.Module):
             q: [b, s, d]
             k: [b, s, d]
         """
-        qk_scale = self.qk_scale.view(1, 1, -1, 2)
-        qk_offset = self.qk_offset.view(1, 1, -1, 2)
+        qk_scale = self.qk_scale.view(1, 1, -1, 2).to(q.dtype)
+        qk_offset = self.qk_offset.view(1, 1, -1, 2).to(q.dtype)
         q = q * qk_scale[:, :, :, 0] + qk_offset[:, :, :, 0]
         k = k * qk_scale[:, :, :, 1] + qk_offset[:, :, :, 1]
         return q, k
@@ -433,7 +459,6 @@ class LaCTSWIGLULayer(nn.Module):
                 max_seqlen=max_seqlen,
                 cu_seqlens=cu_seqlens,
             )
-
             fast_q = rearrange(fast_q, "b s n_h d -> b s (n_h d)", n_h=self.num_heads)
             fast_k = rearrange(fast_k, "b s n_h d -> b s (n_h d)", n_h=self.num_heads)
 
@@ -472,6 +497,22 @@ class LaCTSWIGLULayer(nn.Module):
         )
         fw_lr1, fw_lr2, fw_lr3 = fw_lr.chunk(3, dim=-1)
 
+        # Get learnable w-init regularization scalars for fast weights
+        if self.reg_lr_proj is not None:
+            reg_lr = self.reg_lr_proj(hidden_states)  # [b, s, num_heads * lr_dim_per_head]
+            if self.lr_parameterization == "mamba":
+                reg_lr = torch.nn.functional.softplus(reg_lr.float() + self.base_lr_inv)
+            else:
+                raise NotImplementedError(
+                    f"LR parameterization {self.lr_parameterization} not implemented"
+                )
+            fw_reg_lr = rearrange(
+                reg_lr, "b s (n_h lr_dim) -> (b n_h) s lr_dim", n_h=self.num_fw_heads
+            )
+            fw_reg_lr1, fw_reg_lr2, fw_reg_lr3 = fw_reg_lr.chunk(3, dim=-1)
+        else:
+            fw_reg_lr1, fw_reg_lr2, fw_reg_lr3 = None, None, None
+
         if self.use_momentum:
             momentum = self.momentum_proj(hidden_states).float()  # [b, s, nh]
             momentum = rearrange(
@@ -487,10 +528,12 @@ class LaCTSWIGLULayer(nn.Module):
             fw_w1 = fw_w1.to(torch.float32)
             fw_w2 = fw_w2.to(torch.float32)
 
+        use_fused_kernel = self.use_fused_kernel and self.ttt_loss_type == "dot_product"
+
         # [b * nh, s, d_ttt_head]
         if self.ttt_prenorm:
             # pre-norm version of ttt.   state = state + f(norm(state))
-            if self.use_fused_kernel:
+            if use_fused_kernel:
                 fw_x = prenorm_block_causal_lact_swiglu_fused_kernel_triton(
                     fw_w0,
                     fw_w1,
@@ -519,10 +562,22 @@ class LaCTSWIGLULayer(nn.Module):
                     chunk_size=self.lact_chunk_size,
                     use_muon=self.use_muon,
                     momentum=momentum,
+                    w0_init=fw_w0 if self.w0_init_reg is not None else None,
+                    w1_init=fw_w1 if self.w1_init_reg is not None else None,
+                    w2_init=fw_w2 if self.w2_init_reg is not None else None,
+                    w0_reg=self.w0_init_reg if not self.reg_to_zero else 0.0,
+                    w1_reg=self.w1_init_reg if not self.reg_to_zero else 0.0,
+                    w2_reg=self.w2_init_reg if not self.reg_to_zero else 0.0,
+                    w0_reg_lr=fw_reg_lr1,
+                    w1_reg_lr=fw_reg_lr2,
+                    w2_reg_lr=fw_reg_lr3,
+                    ttt_loss_type=self.ttt_loss_type,
+                    linearize=self.linearize_ttt,
+                    remove_norm=self.remove_norm,
                 )
         else:
             # post-norm version of ttt.   state = norm(state + f(state))
-            if self.use_fused_kernel:
+            if use_fused_kernel:
                 fw_x = postnorm_block_causal_lact_swiglu_fused_kernel_triton(
                     fw_w0,
                     fw_w1,
@@ -551,6 +606,18 @@ class LaCTSWIGLULayer(nn.Module):
                     chunk_size=self.lact_chunk_size,
                     use_muon=self.use_muon,
                     momentum=momentum,
+                    w0_init=fw_w0 if self.w0_init_reg is not None else None,
+                    w1_init=fw_w1 if self.w1_init_reg is not None else None,
+                    w2_init=fw_w2 if self.w2_init_reg is not None else None,
+                    w0_reg=self.w0_init_reg if not self.reg_to_zero else 0.0,
+                    w1_reg=self.w1_init_reg if not self.reg_to_zero else 0.0,
+                    w2_reg=self.w2_init_reg if not self.reg_to_zero else 0.0,
+                    w0_reg_lr=fw_reg_lr1,
+                    w1_reg_lr=fw_reg_lr2,
+                    w2_reg_lr=fw_reg_lr3,
+                    ttt_loss_type=self.ttt_loss_type,
+                    linearize=self.linearize_ttt,
+                    remove_norm=self.remove_norm,
                 )
 
         # per-head output norm for ttt layer.

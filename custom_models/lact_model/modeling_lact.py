@@ -70,6 +70,10 @@ class LaCTBlock(nn.Module):
             fw_init_gain=config.fw_init_gain,
             use_fused_kernel=config.use_fused_kernel,
             fp32_states=config.fp32_states,
+            w_init_regs=config.w_init_regs,
+            reg_to_zero=config.reg_to_zero,
+            linearize_ttt=config.linearize_ttt,
+            remove_norm=config.remove_norm,
         )
 
         self.mlp_norm = (RMSNorm if config.fuse_norm else nn.RMSNorm)(
@@ -349,7 +353,7 @@ class LaCTModel(LaCTPreTrainedModel):
 
 class LaCTForCausalLM(LaCTPreTrainedModel, GenerationMixin):
 
-    _tied_weights_keys = {"lm_head.weight": None}
+    _tied_weights_keys = ["lm_head.weight"]
 
     def __init__(self, config):
         super().__init__(config)

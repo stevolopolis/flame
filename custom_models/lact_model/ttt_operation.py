@@ -2,7 +2,9 @@ import torch.nn.functional as F
 import torch
 
 
-@torch.compile()
+COMPILE_MODE = "default"
+
+@torch.compile(mode=COMPILE_MODE)
 def silu_backprop(dy: torch.Tensor, x: torch.Tensor):
     """
     Args:
@@ -17,7 +19,7 @@ def silu_backprop(dy: torch.Tensor, x: torch.Tensor):
     return dx
 
 
-@torch.compile()
+@torch.compile(mode=COMPILE_MODE)
 def l2_norm(x: torch.Tensor):
     """
     x: [b, l, d]
@@ -27,7 +29,7 @@ def l2_norm(x: torch.Tensor):
     return ret.type(x_type)
 
 
-@torch.compile()
+@torch.compile(mode=COMPILE_MODE)
 def zeropower_via_newtonschulz5(G):
     """
     This is an updated version of the zeropower_via_newtonschulz5 function in here:
@@ -66,7 +68,7 @@ def zeropower_via_newtonschulz5(G):
     return X
 
 
-@torch.compile()
+@torch.compile(mode=COMPILE_MODE)
 @torch.autocast(device_type="cuda", enabled=True, dtype=torch.bfloat16)
 def block_causal_lact_swiglu(
     w0: torch.Tensor,
@@ -81,6 +83,18 @@ def block_causal_lact_swiglu(
     chunk_size: int = 2048,  # test-time training chunk size
     use_muon: bool = False,
     momentum: torch.Tensor = None,  # [b, s, 1]
+    w0_init: torch.Tensor = None,
+    w1_init: torch.Tensor = None,
+    w2_init: torch.Tensor = None,
+    w0_reg: float = 0.1,
+    w1_reg: float = 0.1,
+    w2_reg: float = 0.1,
+    w0_reg_lr: torch.Tensor = None,
+    w1_reg_lr: torch.Tensor = None,
+    w2_reg_lr: torch.Tensor = None,
+    ttt_loss_type: str = "dot_product",
+    linearize: bool = False,
+    remove_norm: bool = False,
 ):
     """
     Block causal LaCT with SwiGLU fast weight function.
@@ -103,6 +117,8 @@ def block_causal_lact_swiglu(
     Outputs:
         o: [b, l, dv]
     """
+
+    assert ttt_loss_type in ["dot_product", "delta_rule"], f"Unsupported ttt_loss_type: {ttt_loss_type}"
 
     # adding detach here sometimes improves stability.
     w0_norm = w0.norm(dim=2, keepdim=True)
@@ -136,6 +152,14 @@ def block_causal_lact_swiglu(
         lr2i = lr2[:, s_index:e_index, :]  # [b, l, d/1] fp32
         lr0i = lr0[:, s_index:e_index, :]  # [b, l, d/1] fp32
 
+        # Learnable w0 regularization scalar (analogous to linear RNN decay rate)
+        if w0_reg_lr is not None:
+            w0_reg_lr_i = w0_reg_lr[:, s_index:e_index, :]
+        if w1_reg_lr is not None:
+            w1_reg_lr_i = w1_reg_lr[:, s_index:e_index, :]
+        if w2_reg_lr is not None:
+            w2_reg_lr_i = w2_reg_lr[:, s_index:e_index, :]
+
         # use previous w0 and w1 to get the final output
         # [b, dh, dk] @ [b, dk, l] -> [b, dh, l]
         h = torch.bmm(w2, qi)
@@ -144,13 +168,19 @@ def block_causal_lact_swiglu(
         output[:, :, s_index:e_index] = torch.bmm(w1, gate * h)
 
         # [b, dh, dk] @ [b, dk, l] -> [b, dh, l]
-        gate_before_act = torch.bmm(w0, ki.transpose(1, 2))
-        hidden_before_mul = torch.bmm(w2, ki.transpose(1, 2))
+        gate_before_act = torch.bmm(w0_init if linearize else w0, ki.transpose(1, 2))
+        hidden_before_mul = torch.bmm(w2_init if linearize else w2, ki.transpose(1, 2))
 
         hidden = F.silu(gate_before_act, inplace=False) * hidden_before_mul
 
+        if ttt_loss_type == "delta_rule":
+            pred_vi = torch.bmm(w1_init if linearize else w1, hidden)
+            update_signal = vi - pred_vi
+        else:
+            update_signal = vi
+
         # [b, dh, dv] @ [b, dv, l] -> [b, dh, l]
-        dhidden = torch.bmm(w1.transpose(1, 2), vi)
+        dhidden = torch.bmm(w1_init.transpose(1, 2) if linearize else w1.transpose(1, 2), update_signal)
 
         dhidden_before_mul = dhidden * F.silu(gate_before_act, inplace=False)
 
@@ -162,10 +192,20 @@ def block_causal_lact_swiglu(
         # it's better to cast the mat to bf16 before bmm.
         # [b, dv, l] @ [b, l, dh] -> [b, dv, dh]
         # it's better to cast the mat to bf16 before bmm.
-        dw1 = torch.bmm(vi, (hidden.transpose(1, 2) * lr1i).type_as(vi))  # [b, d, d]
+        dw1 = torch.bmm(
+            update_signal, (hidden.transpose(1, 2) * lr1i).type_as(update_signal)
+        )  # [b, d, d]
         # [b, dh, l] @ [b, l, dk] -> [b, dh, dk]
         dw0 = torch.bmm(dgate_before_act, (ki * lr0i).type_as(dgate_before_act))
         dw2 = torch.bmm(dhidden_before_mul, (ki * lr2i).type_as(dhidden_before_mul))
+
+        # W init regularization
+        # if w0_init is not None:
+        #     dw0 = dw0 - (w0 - w0_init) * w0_reg if w0_reg_lr is None else dw0 - (w0 - w0_init) * w0_reg_lr_i
+        # if w1_init is not None:
+        #     dw1 = dw1 - (w1 - w1_init) * w1_reg if w1_reg_lr is None else dw1 - (w1 - w1_init) * w1_reg_lr_i
+        # if w2_init is not None:
+        #     dw2 = dw2 - (w2 - w2_init) * w2_reg if w2_reg_lr is None else dw2 - (w2 - w2_init) * w2_reg_lr_i
 
         if momentum is not None:
             m_i = momentum[:, s_index:e_index, :]
@@ -194,10 +234,19 @@ def block_causal_lact_swiglu(
         w0 = w0 + dw0
         w2 = w2 + dw2
 
+        # w init regularization (post update)
+        if w0_init is not None:
+            w0 = w0 - (w0 - w0_init) * w0_reg if w0_reg_lr is None else w0 - (w0 - w0_init) * w0_reg_lr_i
+        if w1_init is not None:
+            w1 = w1 - (w1 - w1_init) * w1_reg if w1_reg_lr is None else w1 - (w1 - w1_init) * w1_reg_lr_i
+        if w2_init is not None:
+            w2 = w2 - (w2 - w2_init) * w2_reg if w2_reg_lr is None else w2 - (w2 - w2_init) * w2_reg_lr_i
+
         # Do channel-wise l2 norm.  conceptually like post-norm.
-        w0 = w0 / (w0.norm(dim=2, keepdim=True) + 1e-5) * w0_norm
-        w1 = w1 / (w1.norm(dim=2, keepdim=True) + 1e-5) * w1_norm
-        w2 = w2 / (w2.norm(dim=2, keepdim=True) + 1e-5) * w2_norm
+        if not remove_norm:
+            w0 = w0 / (w0.norm(dim=2, keepdim=True) + 1e-5) * w0_norm
+            w1 = w1 / (w1.norm(dim=2, keepdim=True) + 1e-5) * w1_norm
+            w2 = w2 / (w2.norm(dim=2, keepdim=True) + 1e-5) * w2_norm
 
     # for the last chunk, don't update the fast weights, directly apply the fast weights to the query.
     s_index = e_index
@@ -214,7 +263,7 @@ def block_causal_lact_swiglu(
     return output.transpose(1, 2)
 
 
-@torch.compile()
+@torch.compile(mode=COMPILE_MODE)
 @torch.autocast(device_type="cuda", enabled=True, dtype=torch.bfloat16)
 def prenorm_block_causal_lact_swiglu(
     w0: torch.Tensor,
@@ -229,6 +278,18 @@ def prenorm_block_causal_lact_swiglu(
     chunk_size: int = 2048,  # test-time training chunk size
     use_muon: bool = False,
     momentum: torch.Tensor = None,  # [b, s, 1]
+    w0_init: torch.Tensor = None,
+    w1_init: torch.Tensor = None,
+    w2_init: torch.Tensor = None,
+    w0_reg: float = 0.1,
+    w1_reg: float = 0.1,
+    w2_reg: float = 0.1,
+    w0_reg_lr: torch.Tensor = None,
+    w1_reg_lr: torch.Tensor = None,
+    w2_reg_lr: torch.Tensor = None,
+    ttt_loss_type: str = "dot_product",
+    linearize: bool = False,
+    remove_norm: bool = False,
 ):
     """
     Block causal LaCT with SwiGLU fast weight function.
@@ -251,6 +312,8 @@ def prenorm_block_causal_lact_swiglu(
     Outputs:
         o: [b, l, dv]
     """
+
+    assert ttt_loss_type in ["dot_product", "delta_rule"], f"Unsupported ttt_loss_type: {ttt_loss_type}"
 
     # adding detach here sometimes improves stability.
     w0_norm = w0.norm(dim=2, keepdim=True)
@@ -286,6 +349,14 @@ def prenorm_block_causal_lact_swiglu(
         lr2i = lr2[:, s_index:e_index, :]  # [b, l, d/1] fp32
         lr0i = lr0[:, s_index:e_index, :]  # [b, l, d/1] fp32
 
+        # Learnable w0 regularization scalar (analogous to linear RNN decay rate)
+        if w0_reg_lr is not None:
+            w0_reg_lr_i = w0_reg_lr[:, s_index:e_index, :]
+        if w1_reg_lr is not None:
+            w1_reg_lr_i = w1_reg_lr[:, s_index:e_index, :]
+        if w2_reg_lr is not None:
+            w2_reg_lr_i = w2_reg_lr[:, s_index:e_index, :]
+
         # use previous w0 and w1 to get the final output
         # [b, dh, dk] @ [b, dk, l] -> [b, dh, l]
         h = torch.bmm(w2, qi)
@@ -299,8 +370,14 @@ def prenorm_block_causal_lact_swiglu(
 
         hidden = F.silu(gate_before_act, inplace=False) * hidden_before_mul
 
+        if ttt_loss_type == "delta_rule":
+            pred_vi = torch.bmm(w1, hidden)
+            update_signal = vi - pred_vi
+        else:
+            update_signal = vi
+
         # [b, dh, dv] @ [b, dv, l] -> [b, dh, l]
-        dhidden = torch.bmm(w1.transpose(1, 2), vi)
+        dhidden = torch.bmm(w1.transpose(1, 2), update_signal)
 
         dhidden_before_mul = dhidden * F.silu(gate_before_act, inplace=False)
 
@@ -312,10 +389,20 @@ def prenorm_block_causal_lact_swiglu(
         # it's better to cast the mat to bf16 before bmm.
         # [b, dv, l] @ [b, l, dh] -> [b, dv, dh]
         # it's better to cast the mat to bf16 before bmm.
-        dw1 = torch.bmm(vi, (hidden.transpose(1, 2) * lr1i).type_as(vi))  # [b, d, d]
+        dw1 = torch.bmm(
+            update_signal, (hidden.transpose(1, 2) * lr1i).type_as(update_signal)
+        )  # [b, d, d]
         # [b, dh, l] @ [b, l, dk] -> [b, dh, dk]
         dw0 = torch.bmm(dgate_before_act, (ki * lr0i).type_as(dgate_before_act))
         dw2 = torch.bmm(dhidden_before_mul, (ki * lr2i).type_as(dhidden_before_mul))
+
+        # W init regularization
+        if w0_init is not None:
+            dw0 = dw0 - (w0 - w0_init) * w0_reg if w0_reg_lr is None else dw0 - (w0 - w0_init) * w0_reg_lr_i
+        if w1_init is not None:
+            dw1 = dw1 - (w1 - w1_init) * w1_reg if w1_reg_lr is None else dw1 - (w1 - w1_init) * w1_reg_lr_i
+        if w2_init is not None:
+            dw2 = dw2 - (w2 - w2_init) * w2_reg if w2_reg_lr is None else dw2 - (w2 - w2_init) * w2_reg_lr_i
 
         if momentum is not None:
             m_i = momentum[:, s_index:e_index, :]
