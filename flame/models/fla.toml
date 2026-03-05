@@ -27,6 +27,23 @@ prefetch_factor = 2
 seed = 42
 varlen = false
 
+[eval]
+batch_size = 32
+seq_len = 2048
+context_len = 2048
+steps = 20480
+data_parallel_replicate_degree = 1
+data_parallel_shard_degree = -1
+tensor_parallel_degree = 1
+dataset = "HuggingFaceFW/fineweb-edu"
+dataset_name = "default"
+num_workers = 32
+pin_memory = false
+persistent_workers = false
+prefetch_factor = 2
+seed = 42
+varlen = false
+
 [optimizer]
 name = "AdamW"
 eps = 1e-15
