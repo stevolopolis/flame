@@ -872,6 +872,120 @@ class JobConfig:
             help="The minimum number of FT replica for each step.",
         )
 
+        # eval configs
+        self.parser.add_argument(
+            "--eval.batch_size", type=int, default=8, help="Batch size"
+        )
+        self.parser.add_argument(
+            "--eval.seq_len", type=int, default=2048, help="Sequence length"
+        )
+        self.parser.add_argument(
+            "--eval.context_len",
+            type=int,
+            default=2048,
+            help="Max length allowed for each sequence",
+        )
+        self.parser.add_argument(
+            "--eval.varlen",
+            action="store_true",
+            help="Whether to take sequences of variable length as input",
+        )
+        self.parser.add_argument(
+            "--eval.steps",
+            type=int,
+            default=10000,
+            help="How many eval steps to run",
+        )
+        self.parser.add_argument(
+            "--eval.dataset",
+            default="HuggingFaceFW/fineweb-edu",
+            help="Dataset to use, with comma separated values",
+        )
+        self.parser.add_argument(
+            "--eval.dataset_name",
+            default=None,
+            help="The name of the dataset config, with comma separated values if provided",
+        )
+        self.parser.add_argument(
+            "--eval.dataset_split",
+            default=None,
+            help="Dataset split to use, with comma separated values if provided",
+        )
+        self.parser.add_argument(
+            "--eval.data_dir",
+            default=None,
+            help="Data dirs to use, with comma separated values if provided",
+        )
+        self.parser.add_argument(
+            "--eval.data_files",
+            default=None,
+            help="Data files to use, with comma separated values if provided",
+        )
+        self.parser.add_argument(
+            "--eval.data_probs",
+            default=None,
+            help="Data sampling probabilities, with comma separated values if provided",
+        )
+        self.parser.add_argument(
+            "--eval.streaming",
+            action="store_true",
+            help="Whether to load dataset in streaming mode, used for huge dataset",
+        )
+        self.parser.add_argument(
+            "--eval.num_workers",
+            type=int,
+            default=32,
+            help="Number of subprocesses to use for data loading. 0 means that the data will be loaded in the main process.",
+        )
+        self.parser.add_argument(
+            "--eval.prefetch_factor",
+            type=int,
+            default=2,
+            help="Number of batches loaded in advance by each worker."
+            "2 means there will be a total of 2 * num_workers batches prefetched across all workers.",
+        )
+        self.parser.add_argument(
+            "--eval.data_parallel_replicate_degree",
+            type=int,
+            default=1,
+            help="""
+            The `data_parallel_replicate_degree` argument specifies the degree of
+            data parallelism for weight replication. When this value is greater
+            than 1, weights will be replicated across `data_parallel_replicate_degree`
+            ranks. If `data_parallel_shard_degree` is also greater than 1, the parallelism
+            method used is HSDP (Hybrid Sharded Data Parallelism). Otherwise, the
+            parallelism method used is DDP (Distributed Data Parallelism).
+            1 means disabled.""",
+        )
+        self.parser.add_argument(
+            "--eval.data_parallel_shard_degree",
+            type=int,
+            default=-1,
+            help="""
+            The `data_parallel_shard_degree` argument specifies the degree of data
+            parallelism for weight sharding. When this value is greater than 1, weights
+            will be sharded across `data_parallel_shard_degree` ranks. If
+            `data_parallel_replicate_degree` is also greater than 1, the parallelism
+            method used is HSDP (Hybrid Sharded Data Parallelism).  Otherwise, the
+            parallelism method used is FSDP (Fully Sharded Data Parallelism).
+
+            -1 means leftover ranks will be used (After DP_REPLICATE/SP/PP). Note that
+            only `data_parallel_shard_degree` can be negative. 1 means disabled.""",
+        )
+        self.parser.add_argument(
+            "--eval.tensor_parallel_degree",
+            type=int,
+            default=1,
+            help="Tensor Parallelism degree. 1 means disabled.",
+        )
+        
+        self.parser.add_argument(
+            "--eval.seed",
+            type=int,
+            default=42,
+            help="Choose the base RNG seed used for eval",
+        )
+
     def to_dict(self):
         return self.args_dict
 
