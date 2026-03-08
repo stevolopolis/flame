@@ -44,11 +44,11 @@ else
 fi
 echo "Learning rate: $lr"
 
-export WANDB_NAME="lact-wregLearnableToZero-raw-postnorm-c32w32-bs512-seqlen256-context256-l4d256-lr$lr-seed$seed"
+export WANDB_NAME="lact-wregLinear-fixed-raw-nonorm-c32w32-bs512-seqlen256-context256-l4d256-lr$lr-seed$seed"
 export DATA_FILES="/scratch/sl12886/data/long-data-collections-without-books/*.arrow"  # change to your data-path
 
-config=configs/XS_lact_swiglu_nh4_fwlow_rank_postnorm_wregToZero.json
-dump_folder=exp/lact/lact-wregLearnableToZero-raw-postnorm-c32w32-bs512-seqlen256-context256-l4d256/run0-lr$lr-seed$seed
+config=configs/XS_lact_swiglu_nh4_fwlow_rank_nonorm_wregLinear0.1.json
+dump_folder=exp/lact/lact-wregLinear-fixed-raw-nonorm-c32w32-bs512-seqlen256-context256-l4d256/run0-lr$lr-seed$seed
 
 if [ -z "$3" ]; then
   # Training
@@ -105,5 +105,6 @@ else
     --eval.data_dir "/scratch/sl12886/data/long-data-collections-val" \
     --eval.num_workers 2 \
     --eval.prefetch_factor 1 \
-    --eval.seed 42
+    --eval.seed 42 \
+    $4
 fi

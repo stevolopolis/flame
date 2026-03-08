@@ -986,6 +986,13 @@ class JobConfig:
             help="Choose the base RNG seed used for eval",
         )
 
+        self.parser.add_argument(
+            "--eval.debug",
+            action="store_true",
+            default=False,
+            help="Whether to run in debug mode. Default is false.",
+        )
+
     def to_dict(self):
         return self.args_dict
 

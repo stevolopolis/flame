@@ -19,6 +19,7 @@ from einops import rearrange, repeat
 
 from .ttt_operation import (
     block_causal_lact_swiglu,
+    block_causal_lact_swiglu_ablate,
     prenorm_block_causal_lact_swiglu,
     l2_norm,
 )
@@ -147,10 +148,11 @@ class LaCTSWIGLULayer(nn.Module):
         fw_init_gain: float = 0.5,  # init the fast weights
         use_fused_kernel: bool = False,
         fp32_states: bool = False,
-        w_init_regs: list[float] = None,
-        reg_to_zero: bool = False,
+        w_reg_lrs: list[float] = None,
+        w_reg_mode: str = None,
         linearize_ttt: bool = False,
         remove_norm: bool = False,
+        track_states: bool = False,
     ):
         super().__init__()
 
@@ -184,22 +186,20 @@ class LaCTSWIGLULayer(nn.Module):
         self.no_v_silu = no_v_silu
         self.ttt_prenorm = ttt_prenorm
         self.ttt_nope = ttt_nope
-        self.w0_init_reg = w_init_regs[0] if w_init_regs is not None else None
-        self.w1_init_reg = w_init_regs[1] if w_init_regs is not None else None
-        self.w2_init_reg = w_init_regs[2] if w_init_regs is not None else None  
-        self.reg_to_zero = reg_to_zero
+        self.w_reg_lrs = w_reg_lrs
+        self.w_reg_mode = w_reg_mode
         self.linearize_ttt = linearize_ttt
         self.remove_norm = remove_norm
+        self.track_states = track_states
 
         print(f"ttt_prenorm: {self.ttt_prenorm}")
-        print(f"w_init_regs: {w_init_regs}")
-        print(f"reg_to_zero: {self.reg_to_zero}")
+        print(f"w_reg_lrs: {self.w_reg_lrs}")
+        print(f"w_reg_mode: {self.w_reg_mode}")
         print(f"ttt_linear: {self.linearize_ttt}")
         print(f"remove_norm: {self.remove_norm}")
+        print(f"track_states: {self.track_states}")
 
-        print(f"w0_init_reg: {self.w0_init_reg}, w1_init_reg: {self.w1_init_reg}, w2_init_reg: {self.w2_init_reg}")
-
-        assert not (w_init_regs is not None and use_fused_kernel), "Fused kernel does not support W init regularization yet."
+        assert not (self.w_reg_lrs is not None and use_fused_kernel), "Fused kernel does not support W init regularization yet."
 
         d_in, d_out = self.fw_head_dim, self.fw_head_dim
         d_h = int(d_in * inter_multi)
@@ -244,9 +244,9 @@ class LaCTSWIGLULayer(nn.Module):
         #### Per-Token LR parameterization.
         self.lr_dim = int(lr_dim * 3 * self.num_fw_heads)
         self.lr_proj = nn.Linear(self.hidden_size, self.lr_dim)
-        if w_init_regs == [None, None, None]:
+        if self.w_reg_lrs == [None, None, None]:
             print("Using learnable w-init regularization scalars for fast weights")
-            self.reg_lr_proj = nn.Linear(self.hidden_size, self.lr_dim)
+            self.reg_lr_proj = nn.Linear(self.hidden_size, 3 * self.num_fw_heads)
         else:
             self.reg_lr_proj = None
         base_lr = 0.001
@@ -498,7 +498,7 @@ class LaCTSWIGLULayer(nn.Module):
         fw_lr1, fw_lr2, fw_lr3 = fw_lr.chunk(3, dim=-1)
 
         # Get learnable w-init regularization scalars for fast weights
-        if self.reg_lr_proj is not None:
+        if self.w_reg_lrs == [None, None, None]:
             reg_lr = self.reg_lr_proj(hidden_states)  # [b, s, num_heads * lr_dim_per_head]
             if self.lr_parameterization == "mamba":
                 reg_lr = torch.nn.functional.softplus(reg_lr.float() + self.base_lr_inv)
@@ -510,8 +510,10 @@ class LaCTSWIGLULayer(nn.Module):
                 reg_lr, "b s (n_h lr_dim) -> (b n_h) s lr_dim", n_h=self.num_fw_heads
             )
             fw_reg_lr1, fw_reg_lr2, fw_reg_lr3 = fw_reg_lr.chunk(3, dim=-1)
-        else:
+        elif self.w_reg_lrs is None:
             fw_reg_lr1, fw_reg_lr2, fw_reg_lr3 = None, None, None
+        else:  # Assuming w_reg_lrs is a list of floats.
+            fw_reg_lr1, fw_reg_lr2, fw_reg_lr3 = self.w_reg_lrs[0], self.w_reg_lrs[1], self.w_reg_lrs[2]
 
         if self.use_momentum:
             momentum = self.momentum_proj(hidden_states).float()  # [b, s, nh]
@@ -529,6 +531,9 @@ class LaCTSWIGLULayer(nn.Module):
             fw_w2 = fw_w2.to(torch.float32)
 
         use_fused_kernel = self.use_fused_kernel and self.ttt_loss_type == "dot_product"
+
+        # Initialize the states of the fast weights
+        fw_w0_norms, fw_w1_norms, fw_w2_norms, fw_w0_dists, fw_w1_dists, fw_w2_dists = None, None, None, None, None, None
 
         # [b * nh, s, d_ttt_head]
         if self.ttt_prenorm:
@@ -549,7 +554,7 @@ class LaCTSWIGLULayer(nn.Module):
                     momentum=momentum,
                 )
             else:
-                fw_x = prenorm_block_causal_lact_swiglu(
+                fw_x, fw_w0_norms, fw_w1_norms, fw_w2_norms, fw_w0_dists, fw_w1_dists, fw_w2_dists = prenorm_block_causal_lact_swiglu(
                     fw_w0,
                     fw_w1,
                     fw_w2,
@@ -562,18 +567,13 @@ class LaCTSWIGLULayer(nn.Module):
                     chunk_size=self.lact_chunk_size,
                     use_muon=self.use_muon,
                     momentum=momentum,
-                    w0_init=fw_w0 if self.w0_init_reg is not None else None,
-                    w1_init=fw_w1 if self.w1_init_reg is not None else None,
-                    w2_init=fw_w2 if self.w2_init_reg is not None else None,
-                    w0_reg=self.w0_init_reg if not self.reg_to_zero else 0.0,
-                    w1_reg=self.w1_init_reg if not self.reg_to_zero else 0.0,
-                    w2_reg=self.w2_init_reg if not self.reg_to_zero else 0.0,
-                    w0_reg_lr=fw_reg_lr1,
-                    w1_reg_lr=fw_reg_lr2,
-                    w2_reg_lr=fw_reg_lr3,
                     ttt_loss_type=self.ttt_loss_type,
+                    w_inits=[fw_w0, fw_w1, fw_w2],
+                    w_reg_lrs=[fw_reg_lr1, fw_reg_lr2, fw_reg_lr3],
+                    w_reg_mode=self.w_reg_mode,
                     linearize=self.linearize_ttt,
                     remove_norm=self.remove_norm,
+                    return_states=self.track_states,
                 )
         else:
             # post-norm version of ttt.   state = norm(state + f(state))
@@ -593,7 +593,7 @@ class LaCTSWIGLULayer(nn.Module):
                     momentum=momentum,
                 )
             else:
-                fw_x = block_causal_lact_swiglu(
+                fw_x, fw_w0_norms, fw_w1_norms, fw_w2_norms, fw_w0_dists, fw_w1_dists, fw_w2_dists = block_causal_lact_swiglu(
                     fw_w0,
                     fw_w1,
                     fw_w2,
@@ -606,19 +606,28 @@ class LaCTSWIGLULayer(nn.Module):
                     chunk_size=self.lact_chunk_size,
                     use_muon=self.use_muon,
                     momentum=momentum,
-                    w0_init=fw_w0 if self.w0_init_reg is not None else None,
-                    w1_init=fw_w1 if self.w1_init_reg is not None else None,
-                    w2_init=fw_w2 if self.w2_init_reg is not None else None,
-                    w0_reg=self.w0_init_reg if not self.reg_to_zero else 0.0,
-                    w1_reg=self.w1_init_reg if not self.reg_to_zero else 0.0,
-                    w2_reg=self.w2_init_reg if not self.reg_to_zero else 0.0,
-                    w0_reg_lr=fw_reg_lr1,
-                    w1_reg_lr=fw_reg_lr2,
-                    w2_reg_lr=fw_reg_lr3,
                     ttt_loss_type=self.ttt_loss_type,
+                    w_inits=[fw_w0, fw_w1, fw_w2],
+                    w_reg_lrs=[fw_reg_lr1, fw_reg_lr2, fw_reg_lr3],
+                    w_reg_mode=self.w_reg_mode,
                     linearize=self.linearize_ttt,
                     remove_norm=self.remove_norm,
+                    return_states=self.track_states,
                 )
+
+        # Track the states of the fast weights
+        if self.track_states:
+            self._track_states(
+                fw_reg_lr1, 
+                fw_reg_lr2, 
+                fw_reg_lr3, 
+                fw_w0_norms,
+                fw_w1_norms,
+                fw_w2_norms,
+                fw_w0_dists,
+                fw_w1_dists,
+                fw_w2_dists,
+            )
 
         # per-head output norm for ttt layer.
         ttt_x_normed = self.ttt_norm(fw_x)
@@ -683,3 +692,103 @@ class LaCTSWIGLULayer(nn.Module):
             (cu_seqlens_q, cu_seqlens_k),
             (max_seqlen_q, max_seqlen_k),
         )
+
+    def _track_states(
+        self,
+        fw_reg_lr1: Union[torch.Tensor, float],
+        fw_reg_lr2: Union[torch.Tensor, float],
+        fw_reg_lr3: Union[torch.Tensor, float],
+        fw_w0_norms: List[torch.Tensor],
+        fw_w1_norms: List[torch.Tensor],
+        fw_w2_norms: List[torch.Tensor],
+        fw_w0_dists: List[torch.Tensor],
+        fw_w1_dists: List[torch.Tensor],
+        fw_w2_dists: List[torch.Tensor],
+    ):
+        """
+        Tracks some states of the fast weights for analysis and debugging.
+
+        States tracked:
+            self.fw_reg_lr1: torch.Tensor, [b, nh, s]
+            self.fw_reg_lr2: torch.Tensor, [b, nh, s]
+            self.fw_reg_lr3: torch.Tensor, [b, nh, s]
+            self.fw_w0_norm: List[torch.Tensor], T tensors in total, each of shape [b, nh]
+            self.fw_w1_norm: List[torch.Tensor], T tensors in total, each of shape [b, nh]
+            self.fw_w2_norm: List[torch.Tensor], T tensors in total, each of shape [b, nh]
+            self.fw_w0_dist: List[torch.Tensor], T tensors in total, each of shape [b, nh]
+            self.fw_w1_dist: List[torch.Tensor], T tensors in total, each of shape [b, nh]
+            self.fw_w2_dist: List[torch.Tensor], T tensors in total, each of shape [b, nh]
+        """
+        self._track_reg_lr(fw_reg_lr1, fw_reg_lr2, fw_reg_lr3)
+        self._track_fw_norm(fw_w0_norms, fw_w1_norms, fw_w2_norms)
+        self._track_fw_dist(fw_w0_dists, fw_w1_dists, fw_w2_dists)
+
+    def _track_reg_lr(
+        self,
+        fw_reg_lr1: Union[torch.Tensor, float],
+        fw_reg_lr2: Union[torch.Tensor, float],
+        fw_reg_lr3: Union[torch.Tensor, float],
+    ) -> None:
+        """
+        Track the w_init regularization scalars for fast weights.
+        
+        Args:
+            fw_reg_lr1: [b * nh, s, 1]
+            fw_reg_lr2: [b * nh, s, 1]
+            fw_reg_lr3: [b * nh, s, 1]
+
+        Stores:
+            self.fw_reg_lr1: [b, nh, s]
+            self.fw_reg_lr2: [b, nh, s]
+            self.fw_reg_lr3: [b, nh, s]
+        """
+        self.fw_reg_lr1 = rearrange(fw_reg_lr1.clone(), "(b n_h) s 1 -> b n_h s", n_h=self.num_fw_heads) if isinstance(fw_reg_lr1, torch.Tensor) else fw_reg_lr1
+        self.fw_reg_lr2 = rearrange(fw_reg_lr2.clone(), "(b n_h) s 1 -> b n_h s", n_h=self.num_fw_heads) if isinstance(fw_reg_lr2, torch.Tensor) else fw_reg_lr2
+        self.fw_reg_lr3 = rearrange(fw_reg_lr3.clone(), "(b n_h) s 1 -> b n_h s", n_h=self.num_fw_heads) if isinstance(fw_reg_lr3, torch.Tensor) else fw_reg_lr3
+
+    def _track_fw_norm(
+        self, 
+        fw_w0_norms: List[torch.Tensor], 
+        fw_w1_norms: List[torch.Tensor], 
+        fw_w2_norms: List[torch.Tensor],
+    ):
+        """
+        Track the l2 norm of the fast weights.
+        
+        Args: 
+            fw_w0_norms: List[torch.Tensor], T tensors in total, each of shape [b * nh]
+            fw_w1_norms: List[torch.Tensor], T tensors in total, each of shape [b * nh]
+            fw_w2_norms: List[torch.Tensor], T tensors in total, each of shape [b * nh]
+
+        Returns:
+            self.fw_w0_norm: torch.Tensor, [b, nh, T]
+            self.fw_w1_norm: torch.Tensor, [b, nh, T]
+            self.fw_w2_norm: torch.Tensor, [b, nh, T]
+        """
+        self.fw_w0_norm = torch.stack(fw_w0_norms, dim=1).reshape(-1, self.num_fw_heads, len(fw_w0_norms))
+        self.fw_w1_norm = torch.stack(fw_w1_norms, dim=1).reshape(-1, self.num_fw_heads, len(fw_w1_norms))
+        self.fw_w2_norm = torch.stack(fw_w2_norms, dim=1).reshape(-1, self.num_fw_heads, len(fw_w2_norms))
+
+    def _track_fw_dist(
+        self, 
+        fw_w0_dists: List[torch.Tensor],
+        fw_w1_dists: List[torch.Tensor],
+        fw_w2_dists: List[torch.Tensor],
+    ) -> None:
+        """
+        Track the distance between the fast weights and the initial weights.
+        
+        Args:
+            fw_w0_dists: List[torch.Tensor], T tensors in total, each of shape [b * nh]
+            fw_w1_dists: List[torch.Tensor], T tensors in total, each of shape [b * nh]
+            fw_w2_dists: List[torch.Tensor], T tensors in total, each of shape [b * nh]
+
+        Stores:
+            self.fw_w0_dist: torch.Tensor, [b, nh, T]
+            self.fw_w1_dist: torch.Tensor, [b, nh, T]
+            self.fw_w2_dist: torch.Tensor, [b, nh, T]
+        """
+        self.fw_w0_dist = torch.stack(fw_w0_dists, dim=1).reshape(-1, self.num_fw_heads, len(fw_w0_dists))
+        self.fw_w1_dist = torch.stack(fw_w1_dists, dim=1).reshape(-1, self.num_fw_heads, len(fw_w1_dists))
+        self.fw_w2_dist = torch.stack(fw_w2_dists, dim=1).reshape(-1, self.num_fw_heads, len(fw_w2_dists))
+    

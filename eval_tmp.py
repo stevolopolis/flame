@@ -107,6 +107,8 @@ class EvalVisualizer:
         """For each model, keep only the result with the minimum perplexity at ctx_len."""
         self.mins = {}
         for result in self.results:
+            if result.metrics["Log Perplexity"] == {}:
+                continue
             if ctx_len in result.metrics["Log Perplexity"]:
                 perp = result.metrics["Log Perplexity"][ctx_len] 
             else:
@@ -187,14 +189,21 @@ def get_model_status(path: str):
     return ckpt, os.path.exists(f"{path}/model.safetensors"), os.path.exists(f"{path}/eval"), os.path.exists(f"{path}/eval/losses.npy")
 
 
-if __name__ == "__main__":
-    args = argparse.ArgumentParser()
-    args.add_argument("--min_mode", type=str, default="val")
-    args = args.parse_args()
-    min_mode = args.min_mode
+def run_visualizer(results: List[EvalResults], save_dir: str, train_len: int = 2**8, filter_len: int = None) -> None:
+    visualizer = EvalVisualizer(results)
 
-    save_dir = "results"
-    os.makedirs(save_dir, exist_ok=True)
+    suffix = ""
+    if filter_len is not None:
+        visualizer.filter_min_perplexity_per_model(ctx_len=filter_len)
+        suffix = f"At{filter_len}"
+
+    visualizer.log_perplexity(train_len=train_len).savefig(f"{save_dir}/log_perplexity{suffix}.pdf")
+    visualizer.per_token_nll(train_len=train_len).savefig(f"{save_dir}/per_token_nll{suffix}.pdf")
+    visualizer.per_token_nll(train_len=train_len, smoothed=True).savefig(f"{save_dir}/per_token_nll_smoothed{suffix}.pdf")
+
+
+if __name__ == "__main__":
+    base_path = Path(f"/scratch/sl12886/ttt/flame/exp")
 
     statuses = {
         "model": [],
@@ -205,18 +214,17 @@ if __name__ == "__main__":
         "has_eval": [],
         "has_losses": [],
     }
-    results = []
-    base_path = Path(f"/scratch/sl12886/ttt/flame/exp")
     model_paths = []
     for p in base_path.rglob("run*lr*seed*"):
-        if (p.is_dir() and "checkpoint" in os.listdir(p)) and \
-            ("wreg0" not in p.parent.name and \
-             "1024" not in p.parent.name and \
-             "fox" not in p.parent.name and \
-             "l8d256" not in p.parent.name and \
-             "d512" not in p.parent.name):
+        if (p.is_dir() and "checkpoint" in os.listdir(p)):
             model_paths.append(p)
 
+    save_dir = "results"
+    os.makedirs(save_dir, exist_ok=True)
+
+    results = []
+    results_per_model = {}
+    
     for path in tqdm(model_paths):
         ckpt, has_safetensors, has_eval, has_losses = get_model_status(path)
         modelname = path.parent.name.replace("-bs512", "").replace("-context1024", "").replace("-context256", "")
@@ -232,29 +240,31 @@ if __name__ == "__main__":
         if not has_losses:
             continue
 
-        results.append(
-            EvalResults(
-                model=modelname, 
-                lr=float(lr), 
-                seed=int(seed), 
-                losses=f"{path}/eval/losses.npy"
-            )
+        eval_results = EvalResults(
+            model=modelname, 
+            lr=float(lr), 
+            seed=int(seed), 
+            losses=f"{path}/eval/losses.npy"
         )
 
-    # Plot metrics
-    visualizer = EvalVisualizer(results)
-    train_len = 2**8
-    val_len = 2**14
-    if min_mode == "val":
-        visualizer.filter_min_perplexity_per_model(ctx_len=val_len) 
-        visualizer.log_perplexity(train_len=train_len).savefig(f"{save_dir}/min_val_log_perplexity.pdf")
-        visualizer.per_token_nll(train_len=train_len).savefig(f"{save_dir}/min_val_per_token_nll.pdf")
-        visualizer.per_token_nll(train_len=train_len, smoothed=True).savefig(f"{save_dir}/min_val_per_token_nll_smoothed.pdf")
-    elif min_mode == "train":
-        visualizer.filter_min_perplexity_per_model(ctx_len=train_len) 
-        visualizer.log_perplexity(train_len=train_len).savefig(f"{save_dir}/min_train_log_perplexity.pdf")
-        visualizer.per_token_nll(train_len=train_len).savefig(f"{save_dir}/min_train_per_token_nll.pdf")
-        visualizer.per_token_nll(train_len=train_len, smoothed=True).savefig(f"{save_dir}/min_train_per_token_nll_smoothed.pdf")
+        # Only keep a subset of models for the summary plots
+        if (
+            "1024" not in path.parent.name
+        ):
+            results.append(eval_results)
+        if modelname not in results_per_model:
+            results_per_model[modelname] = []
+        results_per_model[modelname].append(eval_results)
+
+    # Plot per model
+    for modelname, r in results_per_model.items():
+        save_dir_per_model = f"{save_dir}/{modelname}"
+        os.makedirs(save_dir_per_model, exist_ok=True)
+        run_visualizer(r, save_dir_per_model, train_len=2**8)
+    # Summary plots (filter by train_len)
+    run_visualizer(results, save_dir, train_len=2**8, filter_len=2**8)
+    # Summary plots (filter by val_len)
+    run_visualizer(results, save_dir, train_len=2**8, filter_len=2**14)
 
     # Pretty print the statuses of all models
     pretty_print_model_statuses_rich(statuses)

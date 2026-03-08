@@ -7,7 +7,7 @@
 #SBATCH --cpus-per-task=16
 #SBATCH --ntasks=1
 #SBATCH --gres=gpu:1
-#SBATCH --constraint="l40s"
+#SBATCH --constraint="l40s|h200"
 #SBATCH --job-name=wregL
 #SBATCH --output=slurm/logs/%A.out
 

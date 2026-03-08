@@ -66,10 +66,11 @@ class LaCTSWIGLUConfig(PretrainedConfig):
         use_fused_kernel: bool = False,  # use triton kernel for ttt implementation
         fp32_states: bool = False,  # whether to keep the fast weights in fp32
         # W init regularization
-        w_init_regs: list[float] = None,
-        reg_to_zero: bool = False,
+        w_reg_lrs: list[float] = None,
+        w_reg_mode: str = None,  # "init" or "zero" or None (default)
         linearize_ttt: bool = False,
         remove_norm: bool = False,
+        track_states: bool = False,
         **kwargs,
     ):
         self.hidden_size = hidden_size
@@ -113,10 +114,13 @@ class LaCTSWIGLUConfig(PretrainedConfig):
         self.fw_init_gain = fw_init_gain
         self.use_fused_kernel = use_fused_kernel
         self.fp32_states = fp32_states
-        self.w_init_regs = w_init_regs
-        self.reg_to_zero = reg_to_zero
+
+        self.w_reg_lrs = w_reg_lrs
+        self.w_reg_mode = w_reg_mode
         self.linearize_ttt = linearize_ttt
         self.remove_norm = remove_norm
+        self.track_states = track_states
+        
         super().__init__(
             pad_token_id=pad_token_id,
             bos_token_id=bos_token_id,

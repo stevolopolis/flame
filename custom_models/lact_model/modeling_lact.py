@@ -70,10 +70,11 @@ class LaCTBlock(nn.Module):
             fw_init_gain=config.fw_init_gain,
             use_fused_kernel=config.use_fused_kernel,
             fp32_states=config.fp32_states,
-            w_init_regs=config.w_init_regs,
-            reg_to_zero=config.reg_to_zero,
+            w_reg_lrs=config.w_reg_lrs,
+            w_reg_mode=config.w_reg_mode,
             linearize_ttt=config.linearize_ttt,
             remove_norm=config.remove_norm,
+            track_states=config.track_states,
         )
 
         self.mlp_norm = (RMSNorm if config.fuse_norm else nn.RMSNorm)(

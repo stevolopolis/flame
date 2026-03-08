@@ -2,13 +2,13 @@
 # Usage: sbatch run.SBATCH <filename>
 
 #SBATCH --account=torch_pr_36_mren
-#SBATCH --time=02:30:00
+#SBATCH --time=02:00:00
 #SBATCH --mem=64g
 #SBATCH --cpus-per-task=16
 #SBATCH --ntasks=1
 #SBATCH --gres=gpu:1
 #SBATCH --constraint="l40s|h200"
-#SBATCH --job-name=wregL
+#SBATCH --job-name=gdnM
 #SBATCH --output=slurm/logs/%A.out
 
 
@@ -44,11 +44,11 @@ else
 fi
 echo "Learning rate: $lr"
 
-export WANDB_NAME="lact-wregLearnableToZero-raw-postnorm-c32w32-bs512-seqlen256-context256-l4d256-lr$lr-seed$seed"
+export WANDB_NAME="gdnM-bs512-seqlen256-context256-l4d256-lr$lr-seed$seed"
 export DATA_FILES="/scratch/sl12886/data/long-data-collections-without-books/*.arrow"  # change to your data-path
 
-config=configs/XS_lact_swiglu_nh4_fwlow_rank_postnorm_wregToZero.json
-dump_folder=exp/lact/lact-wregLearnableToZero-raw-postnorm-c32w32-bs512-seqlen256-context256-l4d256/run0-lr$lr-seed$seed
+config=configs/XS_gated_deltanet_matching.json
+dump_folder=exp/gdnM/gdnM-bs512-seqlen256-context256-l4d256/run0-lr$lr-seed$seed
 
 if [ -z "$3" ]; then
   # Training
@@ -96,9 +96,9 @@ else
     --job.dump_folder $dump_folder \
     --model.config $config \
     --model.tokenizer_path fla-hub/transformer-1.3B-100B \
-    --eval.batch_size 64 \
-    --eval.seq_len 16384 \
-    --eval.context_len 16384 \
+    --eval.batch_size 16 \
+    --eval.seq_len 65536 \
+    --eval.context_len 65536 \
     --eval.steps 128 \
     --eval.dataset arrow \
     --eval.dataset_split train \

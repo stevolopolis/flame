@@ -8,7 +8,7 @@
 #SBATCH --ntasks=1
 #SBATCH --gres=gpu:1
 #SBATCH --constraint="l40s|h200"
-#SBATCH --job-name=wregL
+#SBATCH --job-name=wregTZ
 #SBATCH --output=slurm/logs/%A.out
 
 
@@ -44,13 +44,21 @@ else
 fi
 echo "Learning rate: $lr"
 
-export WANDB_NAME="lact-wregLearnableToZero-raw-postnorm-c32w32-bs512-seqlen256-context256-l4d256-lr$lr-seed$seed"
+# w_init_regs sweeps: [0.001, 0.01, 0.1]
+if [ -z "$3" ]; then
+  w_init_regs=0.001
+else
+  w_init_regs=$3
+fi
+echo "W init regularization: $w_init_regs"
+
+export WANDB_NAME="lact-wregToZero$w_init_regs-c32w32-bs512-seqlen256-context256-l4d256-lr$lr-seed$seed"
 export DATA_FILES="/scratch/sl12886/data/long-data-collections-without-books/*.arrow"  # change to your data-path
 
-config=configs/XS_lact_swiglu_nh4_fwlow_rank_postnorm_wregToZero.json
-dump_folder=exp/lact/lact-wregLearnableToZero-raw-postnorm-c32w32-bs512-seqlen256-context256-l4d256/run0-lr$lr-seed$seed
+config=configs/XS_lact_swiglu_nh4_fwlow_rank_momentum_muon_wregToZero$w_init_regs.json
+dump_folder=exp/lact/lact-wregToZero$w_init_regs-c32w32-bs512-seqlen256-context256-l4d256/run0-lr$lr-seed$seed
 
-if [ -z "$3" ]; then
+if [ -z "$4" ]; then
   # Training
   echo "Running training..."
 

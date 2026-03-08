@@ -7,7 +7,7 @@
 #SBATCH --cpus-per-task=16
 #SBATCH --ntasks=1
 #SBATCH --gres=gpu:1
-#SBATCH --constraint="l40s"
+#SBATCH --constraint="l40s|h200"
 #SBATCH --job-name=wregL
 #SBATCH --output=slurm/logs/%A.out
 
@@ -105,5 +105,6 @@ else
     --eval.data_dir "/scratch/sl12886/data/long-data-collections-val" \
     --eval.num_workers 2 \
     --eval.prefetch_factor 1 \
-    --eval.seed 42
+    --eval.seed 42 \
+    $4
 fi
