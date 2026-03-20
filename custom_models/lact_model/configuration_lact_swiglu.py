@@ -65,23 +65,21 @@ class LaCTSWIGLUConfig(PretrainedConfig):
         fw_init_gain: float = 0.5,
         use_fused_kernel: bool = False,  # use triton kernel for ttt implementation
         fp32_states: bool = False,  # whether to keep the fast weights in fp32
-        # W init regularization
-        w_reg_lrs: list[float] = None,
+        # The important ablation factors
+        w_reg_lrs: list[float] = None,  # Activates weight decays. Learnable if [None, None, None]. Fixed if [float, float, float].
+        clip_grad_norm: float = None,  # Clips the gradient norm of the fast weights.
+        weight_norm: bool = True,  # Applies weight normalization to the fast weights.
+        track_states: bool = False,  # Tracks the states of the fast weights.
+        # The rest of the ablation factors used during exploration
+        ablation: bool = False,  # True if we want to use the following ablations factors. Used during exploration.
         w_reg_mode: str = None,  # "init" or "zero" or None (default)
-        linearize_ttt: bool = False,
-        remove_norm: bool = False,
-        track_states: bool = False,
-        ablation: bool = False,
-        ablation2: bool = False,
-        fwd_mode: str = "gdn",
-        update_then_apply: bool = False,
-        normalize: bool = False,
-        scale: bool = False,
-        weight_norm: bool = False,
-        mean_reg_lr: bool = False,
-        no_reg_lr: bool = False,
-        clip_grad_norm: float = None,
-        rand_w1: bool = False,
+        fwd_mode: str = "gdn",  # Architecture of the fast weights. {gdn, gdn+, factorized_gdn, factorized_gdn+, lact, lact+}
+        update_then_apply: bool = False,  # Whether to update the fast weights then apply them to the hidden states.    
+        normalize: bool = False,  # Normalizes the hidden states in the fast weights.
+        scale: bool = False,  # Scales the fast weights.
+        mean_reg_lr: bool = False,  # Uses the mean of the fast weights for regularization.
+        no_reg_lr: bool = False,  # Does not use regularization for the fast weights.
+        rand_w1: bool = False,  # Randomly initializes the fast weights.
         **kwargs,
     ):
         self.hidden_size = hidden_size
@@ -126,22 +124,24 @@ class LaCTSWIGLUConfig(PretrainedConfig):
         self.use_fused_kernel = use_fused_kernel
         self.fp32_states = fp32_states
 
+        # The important ablation factors
         self.w_reg_lrs = w_reg_lrs
-        self.w_reg_mode = w_reg_mode
-        self.linearize_ttt = linearize_ttt
-        self.remove_norm = remove_norm
+        self.weight_norm = weight_norm
+        self.clip_grad_norm = clip_grad_norm
         self.track_states = track_states
+
+        # The rest of the ablation factors used during exploration
+        self.w_reg_mode = w_reg_mode
         self.ablation = ablation
-        self.ablation2 = ablation2
         self.fwd_mode = fwd_mode
         self.update_then_apply = update_then_apply
         self.normalize = normalize
         self.scale = scale
-        self.weight_norm = weight_norm
         self.mean_reg_lr = mean_reg_lr
         self.no_reg_lr = no_reg_lr
-        self.clip_grad_norm = clip_grad_norm
         self.rand_w1 = rand_w1
+
+
         super().__init__(
             pad_token_id=pad_token_id,
             bos_token_id=bos_token_id,

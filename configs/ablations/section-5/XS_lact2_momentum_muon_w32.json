@@ -25,16 +25,15 @@
     "w0_w2_low_rank": 32,
     "fw_init_gain": 0.5,
     "use_momentum": true,
-    "w_reg_lrs": [null, null, null],
     "ttt_prenorm": false,
     "ttt_loss_type": "delta_rule",
     "ttt_nope": true,
-    "ablation": true,
-    "ablation2": true,
-    "clip_grad_norm": 1.0,
     "rope_theta": 1000000,
     "norm_eps": 1e-06,
     "tie_word_embeddings": false,
     "use_cache": true,
-    "vocab_size": 32000
+    "vocab_size": 32000,
+    "w_reg_lrs": [null, null, null],
+    "clip_grad_norm": 1.0,
+    "weight_norm": true
 }

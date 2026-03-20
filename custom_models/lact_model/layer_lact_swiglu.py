@@ -149,21 +149,20 @@ class LaCTSWIGLULayer(nn.Module):
         fw_init_gain: float = 0.5,  # init the fast weights
         use_fused_kernel: bool = False,
         fp32_states: bool = False,
+        # The main ablation factors
         w_reg_lrs: list[float] = None,
-        w_reg_mode: str = None,
-        linearize_ttt: bool = False,
-        remove_norm: bool = False,
+        weight_norm: bool = False,
+        clip_grad_norm: float = None,
         track_states: bool = False,
+        # The rest of the ablation factors used during exploration
         ablation: bool = False,
-        ablation2: bool = False,
+        w_reg_mode: str = None,
         fwd_mode: str = "gdn",
         update_then_apply: bool = False,
         normalize: bool = False,
         scale: bool = False,
-        weight_norm: bool = False,
         mean_reg_lr: bool = False,
         no_reg_lr: bool = False,
-        clip_grad_norm: float = None,
         rand_w1: bool = False,
     ):
         super().__init__()
@@ -198,29 +197,21 @@ class LaCTSWIGLULayer(nn.Module):
         self.no_v_silu = no_v_silu
         self.ttt_prenorm = ttt_prenorm
         self.ttt_nope = ttt_nope
+        # The main ablation factors
         self.w_reg_lrs = w_reg_lrs
-        self.w_reg_mode = w_reg_mode
-        self.linearize_ttt = linearize_ttt
-        self.remove_norm = remove_norm
+        self.weight_norm = weight_norm
+        self.clip_grad_norm = clip_grad_norm
         self.track_states = track_states
+        # The rest of the ablation factors used during exploration
         self.ablation = ablation
-        self.ablation2 = ablation2
+        self.w_reg_mode = w_reg_mode
         self.fwd_mode = fwd_mode
         self.update_then_apply = update_then_apply
         self.normalize = normalize
         self.scale = scale
-        self.weight_norm = weight_norm
         self.mean_reg_lr = mean_reg_lr
         self.no_reg_lr = no_reg_lr
-        self.clip_grad_norm = clip_grad_norm
         self.rand_w1 = rand_w1
-
-        print(f"ttt_prenorm: {self.ttt_prenorm}")
-        print(f"w_reg_lrs: {self.w_reg_lrs}")
-        print(f"w_reg_mode: {self.w_reg_mode}")
-        print(f"ttt_linear: {self.linearize_ttt}")
-        print(f"remove_norm: {self.remove_norm}")
-        print(f"track_states: {self.track_states}")
 
         assert not (self.w_reg_lrs is not None and use_fused_kernel), "Fused kernel does not support W init regularization yet."
 
@@ -268,21 +259,15 @@ class LaCTSWIGLULayer(nn.Module):
         if self.ablation and not self.rand_w1:
             self.w1.requires_grad = False
 
-        #### Per-Token LR parameterization.
-        self.lr_dim = int(lr_dim * 3 * self.num_fw_heads)
-        self.lr_proj = nn.Linear(self.hidden_size, self.lr_dim)
+        # SETUPS FOR THE ABLATION FACTORS
+        # Learnable decay projections 
         if self.w_reg_lrs == [None, None, None]:
             print("Using learnable w-init regularization scalars for fast weights")
             self.reg_lr_proj = nn.Linear(self.hidden_size, 3 * self.num_fw_heads)
         else:
             self.reg_lr_proj = None
-        base_lr = 0.001
-        # Lr parameterization and initialization
-        if lr_parameterization.lower() == "mamba" or lr_parameterization == "mamba+++":
-            self.base_lr_inv = inv_softplus(base_lr)
-        self.lr_parameterization = lr_parameterization
-
-        if self.ablation:
+        # Learnable decay parameters
+        if self.lr_parameterization == "gdn" or self.lr_parameterization == "gdn+" or self.lr_parameterization == "mamba+" or self.lr_parameterization == "mamba++" or self.lr_parameterization == "mamba+++":
             A = torch.empty(self.num_fw_heads * 3, dtype=torch.float32).uniform_(0, 16)
             self.A_log = nn.Parameter(torch.log(A))
             self.A_log._no_weight_decay = True
@@ -305,6 +290,15 @@ class LaCTSWIGLULayer(nn.Module):
             self.A_log = None
             self.dt_bias = None
 
+        #### Per-Token LR parameterization.
+        self.lr_dim = int(lr_dim * 3 * self.num_fw_heads)
+        self.lr_proj = nn.Linear(self.hidden_size, self.lr_dim)
+        base_lr = 0.001
+        # Lr parameterization and initialization
+        if lr_parameterization.lower() == "mamba" or lr_parameterization == "mamba+++":
+            self.base_lr_inv = inv_softplus(base_lr)
+        self.lr_parameterization = lr_parameterization
+        
         #### per-channel scaling and offset for Q, and K.
         self.qk_scale = nn.Parameter(torch.ones(hidden_size, 2))
         self.qk_offset = nn.Parameter(torch.zeros(hidden_size, 2))
@@ -597,49 +591,30 @@ class LaCTSWIGLULayer(nn.Module):
             fw_w1 = fw_w1 * 0
         # [b * nh, s, d_ttt_head]
         if self.ablation:
-            if self.ablation2:
-                fw_x, fw_w0_norms, fw_w1_norms, fw_w2_norms, fw_w0_dists, fw_w1_dists, fw_w2_dists = block_causal_lact_swiglu2(
-                    fw_w0,
-                    fw_w1,
-                    fw_w2,
-                    fast_q,
-                    fast_k,
-                    fast_v,
-                    fw_lr1,
-                    fw_lr2,
-                    fw_lr3,
-                    chunk_size=self.lact_chunk_size,
-                    use_muon=self.use_muon,
-                    momentum=momentum,
-                    w_reg_lrs=[fw_reg_lr1, fw_reg_lr2, fw_reg_lr3],
-                    clip_grad_norm=self.clip_grad_norm,
-                    return_states=self.track_states,
-                )
-            else:
-                fw_x, fw_w0_norms, fw_w1_norms, fw_w2_norms, fw_w0_dists, fw_w1_dists, fw_w2_dists = block_causal_lact_swiglu_ablate(
-                    fw_w0,
-                    fw_w1,
-                    fw_w2,
-                    fast_q,
-                    fast_k,
-                    fast_v,
-                    fw_lr1,
-                    fw_lr2,
-                    fw_lr3,
-                    w_reg_lrs=[fw_reg_lr1, fw_reg_lr2, fw_reg_lr3],
-                    chunk_size=self.lact_chunk_size,
-                    ttt_loss_type=self.ttt_loss_type,
-                    fwd_mode=self.fwd_mode,
-                    update_then_apply=self.update_then_apply,
-                    normalize=self.normalize,
-                    scale=self.scale,
-                    weight_norm=self.weight_norm,
-                    mean_reg_lr=self.mean_reg_lr,
-                    no_reg_lr=self.no_reg_lr,
-                    clip_grad_norm=self.clip_grad_norm,
-                    rand_w1=self.rand_w1,
-                    return_states=self.track_states,
-                )
+            fw_x, fw_w0_norms, fw_w1_norms, fw_w2_norms, fw_w0_dists, fw_w1_dists, fw_w2_dists = block_causal_lact_swiglu_ablate(
+                fw_w0,
+                fw_w1,
+                fw_w2,
+                fast_q,
+                fast_k,
+                fast_v,
+                fw_lr1,
+                fw_lr2,
+                fw_lr3,
+                w_reg_lrs=[fw_reg_lr1, fw_reg_lr2, fw_reg_lr3],
+                chunk_size=self.lact_chunk_size,
+                ttt_loss_type=self.ttt_loss_type,
+                fwd_mode=self.fwd_mode,
+                update_then_apply=self.update_then_apply,
+                normalize=self.normalize,
+                scale=self.scale,
+                weight_norm=self.weight_norm,
+                mean_reg_lr=self.mean_reg_lr,
+                no_reg_lr=self.no_reg_lr,
+                clip_grad_norm=self.clip_grad_norm,
+                rand_w1=self.rand_w1,
+                return_states=self.track_states,
+            )
         else:
             if self.ttt_prenorm:
                 # pre-norm version of ttt.   state = state + f(norm(state))
@@ -673,10 +648,8 @@ class LaCTSWIGLULayer(nn.Module):
                         use_muon=self.use_muon,
                         momentum=momentum,
                         ttt_loss_type=self.ttt_loss_type,
-                        w_inits=[fw_w0, fw_w1, fw_w2],
                         w_reg_lrs=[fw_reg_lr1, fw_reg_lr2, fw_reg_lr3],
-                        w_reg_mode=self.w_reg_mode,
-                        linearize=self.linearize_ttt,
+                        clip_grad_norm=self.clip_grad_norm,
                         remove_norm=self.remove_norm,
                         return_states=self.track_states,
                     )
@@ -712,10 +685,8 @@ class LaCTSWIGLULayer(nn.Module):
                         use_muon=self.use_muon,
                         momentum=momentum,
                         ttt_loss_type=self.ttt_loss_type,
-                        w_inits=[fw_w0, fw_w1, fw_w2],
                         w_reg_lrs=[fw_reg_lr1, fw_reg_lr2, fw_reg_lr3],
-                        w_reg_mode=self.w_reg_mode,
-                        linearize=self.linearize_ttt,
+                        clip_grad_norm=self.clip_grad_norm,
                         remove_norm=self.remove_norm,
                         return_states=self.track_states,
                     )
