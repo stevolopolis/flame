@@ -21,7 +21,6 @@ from .ttt_operation import (
     block_causal_lact_swiglu,
     block_causal_lact_swiglu_ablate,
     prenorm_block_causal_lact_swiglu,
-    block_causal_lact_swiglu2,
     l2_norm,
 )
 
@@ -259,6 +258,37 @@ class LaCTSWIGLULayer(nn.Module):
         if self.ablation and not self.rand_w1:
             self.w1.requires_grad = False
 
+        #### Per-Token LR parameterization.
+        self.lr_dim = int(lr_dim * 3 * self.num_fw_heads)
+        self.lr_proj = nn.Linear(self.hidden_size, self.lr_dim)
+        base_lr = 0.001
+        # Lr parameterization and initialization
+        if lr_parameterization.lower() == "mamba" or lr_parameterization == "mamba+++":
+            self.base_lr_inv = inv_softplus(base_lr)
+        self.lr_parameterization = lr_parameterization
+
+        #### per-channel scaling and offset for Q, and K.
+        self.qk_scale = nn.Parameter(torch.ones(hidden_size, 2))
+        self.qk_offset = nn.Parameter(torch.zeros(hidden_size, 2))
+        self.learnable_ttt_scale = learnable_ttt_scale
+        if self.learnable_ttt_scale:
+            # per-head scaling.
+            self.ttt_scale_proj = nn.Linear(hidden_size, self.num_fw_heads)
+
+        # ttt output norm per head.
+        self.ttt_norm = RMSNorm(self.fw_head_dim, elementwise_affine=True)
+
+        self.use_momentum = use_momentum
+        if self.use_momentum:
+            self.momentum_proj = nn.Sequential(
+                nn.Linear(hidden_size, self.num_fw_heads),
+                nn.Sigmoid(),
+            )
+
+        self.ttt_loss_type = ttt_loss_type
+        self.use_fused_kernel = use_fused_kernel
+        self.fp32_states = fp32_states
+
         # SETUPS FOR THE ABLATION FACTORS
         # Learnable decay projections 
         if self.w_reg_lrs == [None, None, None]:
@@ -289,37 +319,6 @@ class LaCTSWIGLULayer(nn.Module):
         else:
             self.A_log = None
             self.dt_bias = None
-
-        #### Per-Token LR parameterization.
-        self.lr_dim = int(lr_dim * 3 * self.num_fw_heads)
-        self.lr_proj = nn.Linear(self.hidden_size, self.lr_dim)
-        base_lr = 0.001
-        # Lr parameterization and initialization
-        if lr_parameterization.lower() == "mamba" or lr_parameterization == "mamba+++":
-            self.base_lr_inv = inv_softplus(base_lr)
-        self.lr_parameterization = lr_parameterization
-        
-        #### per-channel scaling and offset for Q, and K.
-        self.qk_scale = nn.Parameter(torch.ones(hidden_size, 2))
-        self.qk_offset = nn.Parameter(torch.zeros(hidden_size, 2))
-        self.learnable_ttt_scale = learnable_ttt_scale
-        if self.learnable_ttt_scale:
-            # per-head scaling.
-            self.ttt_scale_proj = nn.Linear(hidden_size, self.num_fw_heads)
-
-        # ttt output norm per head.
-        self.ttt_norm = RMSNorm(self.fw_head_dim, elementwise_affine=True)
-
-        self.use_momentum = use_momentum
-        if self.use_momentum:
-            self.momentum_proj = nn.Sequential(
-                nn.Linear(hidden_size, self.num_fw_heads),
-                nn.Sigmoid(),
-            )
-
-        self.ttt_loss_type = ttt_loss_type
-        self.use_fused_kernel = use_fused_kernel
-        self.fp32_states = fp32_states
 
         assert self.ttt_loss_type in [
             "dot_product",
