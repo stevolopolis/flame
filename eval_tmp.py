@@ -21,6 +21,7 @@ def pretty_print_model_statuses_rich(statuses: Dict[str, List[Any]]) -> None:
         "has_safetensors",
         "has_eval",
         "has_losses",
+        "n_nans",
     ]
     if not all(col in statuses for col in columns):
         missing = [col for col in columns if col not in statuses]
@@ -39,6 +40,7 @@ def pretty_print_model_statuses_rich(statuses: Dict[str, List[Any]]) -> None:
     table.add_column("Safetensors", justify="center")
     table.add_column("Eval Dir", justify="center")
     table.add_column("Losses", justify="center")
+    table.add_column("N Nans", justify="center")
 
     for i in range(n_rows):
         lr_val = statuses["lr"][i]
@@ -50,14 +52,18 @@ def pretty_print_model_statuses_rich(statuses: Dict[str, List[Any]]) -> None:
         def rich_ckpt(v: Any) -> str:
             return f"[green]{v}[/green]" if 40960 else f"[red]{v}[/red]"
 
+        def rich_n_nans(v: Any) -> str:
+            return f"[green]{v}[/green]" if v == 0 else f"[red]{v}[/red]"
+
         table.add_row(
             str(statuses["model"][i]),
             lr_str,
             str(statuses["seed"][i]),
-            str(statuses["ckpt"][i]),
+            rich_ckpt(str(statuses["ckpt"][i])),
             rich_bool(statuses["has_safetensors"][i]),
             rich_bool(statuses["has_eval"][i]),
             rich_bool(statuses["has_losses"][i]),
+            rich_n_nans(statuses["n_nans"][i]),
         )
 
     console = Console()
@@ -75,9 +81,18 @@ class EvalResults:
         if isinstance(self.losses, str):
             self.losses = np.load(self.losses)
 
+        self.losses, self.nan_rows = self._remove_nans(self.losses)
+
         self.metrics = self._calculate_metrics(self.losses)
         # Remove the raw losses array to save memory
         del self.losses
+
+    def _remove_nans(self, losses: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
+        """
+        Returns a subset of rows without any NaN values and return the indices of the problematic rows.
+        """
+        nan_rows = np.isnan(losses).any(axis=1)
+        return losses[~nan_rows], np.nonzero(nan_rows)[0]
 
     def _calculate_metrics(self, losses: np.ndarray) -> dict:
         """
@@ -213,10 +228,11 @@ if __name__ == "__main__":
         "has_safetensors": [],
         "has_eval": [],
         "has_losses": [],
+        "n_nans": [],
     }
     model_paths = []
     for p in base_path.rglob("run*lr*seed*"):
-        if (p.is_dir() and "checkpoint" in os.listdir(p)):
+        if (p.is_dir() and "checkpoint" in os.listdir(p)) and "section-5" in str(p.resolve()):
             model_paths.append(p)
 
     save_dir = "results"
@@ -238,6 +254,7 @@ if __name__ == "__main__":
         statuses["has_eval"].append(has_eval)
         statuses["has_losses"].append(has_losses)
         if not has_losses:
+            statuses["n_nans"].append(0)
             continue
 
         eval_results = EvalResults(
@@ -246,6 +263,8 @@ if __name__ == "__main__":
             seed=int(seed), 
             losses=f"{path}/eval/losses.npy"
         )
+
+        statuses["n_nans"].append(len(eval_results.nan_rows))
 
         # Only keep a subset of models for the summary plots
         if (
