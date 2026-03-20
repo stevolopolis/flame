@@ -71,6 +71,17 @@ class LaCTSWIGLUConfig(PretrainedConfig):
         linearize_ttt: bool = False,
         remove_norm: bool = False,
         track_states: bool = False,
+        ablation: bool = False,
+        ablation2: bool = False,
+        fwd_mode: str = "gdn",
+        update_then_apply: bool = False,
+        normalize: bool = False,
+        scale: bool = False,
+        weight_norm: bool = False,
+        mean_reg_lr: bool = False,
+        no_reg_lr: bool = False,
+        clip_grad_norm: float = None,
+        rand_w1: bool = False,
         **kwargs,
     ):
         self.hidden_size = hidden_size
@@ -120,7 +131,17 @@ class LaCTSWIGLUConfig(PretrainedConfig):
         self.linearize_ttt = linearize_ttt
         self.remove_norm = remove_norm
         self.track_states = track_states
-        
+        self.ablation = ablation
+        self.ablation2 = ablation2
+        self.fwd_mode = fwd_mode
+        self.update_then_apply = update_then_apply
+        self.normalize = normalize
+        self.scale = scale
+        self.weight_norm = weight_norm
+        self.mean_reg_lr = mean_reg_lr
+        self.no_reg_lr = no_reg_lr
+        self.clip_grad_norm = clip_grad_norm
+        self.rand_w1 = rand_w1
         super().__init__(
             pad_token_id=pad_token_id,
             bos_token_id=bos_token_id,

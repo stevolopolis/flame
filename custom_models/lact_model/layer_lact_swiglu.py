@@ -21,6 +21,7 @@ from .ttt_operation import (
     block_causal_lact_swiglu,
     block_causal_lact_swiglu_ablate,
     prenorm_block_causal_lact_swiglu,
+    block_causal_lact_swiglu2,
     l2_norm,
 )
 
@@ -153,6 +154,17 @@ class LaCTSWIGLULayer(nn.Module):
         linearize_ttt: bool = False,
         remove_norm: bool = False,
         track_states: bool = False,
+        ablation: bool = False,
+        ablation2: bool = False,
+        fwd_mode: str = "gdn",
+        update_then_apply: bool = False,
+        normalize: bool = False,
+        scale: bool = False,
+        weight_norm: bool = False,
+        mean_reg_lr: bool = False,
+        no_reg_lr: bool = False,
+        clip_grad_norm: float = None,
+        rand_w1: bool = False,
     ):
         super().__init__()
 
@@ -191,6 +203,17 @@ class LaCTSWIGLULayer(nn.Module):
         self.linearize_ttt = linearize_ttt
         self.remove_norm = remove_norm
         self.track_states = track_states
+        self.ablation = ablation
+        self.ablation2 = ablation2
+        self.fwd_mode = fwd_mode
+        self.update_then_apply = update_then_apply
+        self.normalize = normalize
+        self.scale = scale
+        self.weight_norm = weight_norm
+        self.mean_reg_lr = mean_reg_lr
+        self.no_reg_lr = no_reg_lr
+        self.clip_grad_norm = clip_grad_norm
+        self.rand_w1 = rand_w1
 
         print(f"ttt_prenorm: {self.ttt_prenorm}")
         print(f"w_reg_lrs: {self.w_reg_lrs}")
@@ -237,9 +260,13 @@ class LaCTSWIGLULayer(nn.Module):
             self.w2 = nn.Parameter(
                 torch.randn(self.num_fw_heads, int(d_h), d_in) / math.sqrt(d_in)
             )  # [num_fw_heads, d_h, d_in]
+
         self.w1 = nn.Parameter(
-            torch.randn(self.num_fw_heads, int(d_out), d_h) / math.sqrt(d_h)
+            torch.randn(self.num_fw_heads, int(d_out), d_h) / math.sqrt(d_h) if (not self.ablation or self.rand_w1) else 
+            torch.zeros(self.num_fw_heads, int(d_out), d_h)
         )  # [num_fw_heads, d_out, d_h]
+        if self.ablation and not self.rand_w1:
+            self.w1.requires_grad = False
 
         #### Per-Token LR parameterization.
         self.lr_dim = int(lr_dim * 3 * self.num_fw_heads)
@@ -251,9 +278,32 @@ class LaCTSWIGLULayer(nn.Module):
             self.reg_lr_proj = None
         base_lr = 0.001
         # Lr parameterization and initialization
-        if lr_parameterization.lower() == "mamba":
+        if lr_parameterization.lower() == "mamba" or lr_parameterization == "mamba+++":
             self.base_lr_inv = inv_softplus(base_lr)
         self.lr_parameterization = lr_parameterization
+
+        if self.ablation:
+            A = torch.empty(self.num_fw_heads * 3, dtype=torch.float32).uniform_(0, 16)
+            self.A_log = nn.Parameter(torch.log(A))
+            self.A_log._no_weight_decay = True
+            # hard coded for now
+            dt_min = 0.001
+            dt_max = 0.1
+            dt_init_floor = 1e-4
+            dt = torch.exp(
+                torch.rand(self.num_fw_heads * 3) * (math.log(dt_max) - math.log(dt_min))
+                + math.log(dt_min),
+            )
+            dt = torch.clamp(dt, min=dt_init_floor)
+            # Inverse of softplus: https://github.com/pytorch/pytorch/issues/72759
+            inv_dt = dt + torch.log(-torch.expm1(-dt))
+            self.dt_bias = nn.Parameter(inv_dt)
+            # Just to be explicit. Without this we already don't put wd on dt_bias because of the check
+            # name.endswith("bias") in param_grouping.py
+            self.dt_bias._no_weight_decay = True
+        else:
+            self.A_log = None
+            self.dt_bias = None
 
         #### per-channel scaling and offset for Q, and K.
         self.qk_scale = nn.Parameter(torch.ones(hidden_size, 2))
@@ -486,8 +536,12 @@ class LaCTSWIGLULayer(nn.Module):
         )  # [nh, d_out, d_h] -> [b*nh, d_out, d_h]
 
         lr = self.lr_proj(hidden_states)  # [b, s, num_heads * lr_dim_per_head]
-        if self.lr_parameterization == "mamba":
+        if self.lr_parameterization == "gdn" or self.lr_parameterization == "gdn2" or self.lr_parameterization == "gdn+" or self.lr_parameterization == "mamba++":
+            lr = torch.nn.functional.sigmoid(lr.float())
+        elif self.lr_parameterization == "mamba" or self.lr_parameterization == "mamba+++":
             lr = torch.nn.functional.softplus(lr.float() + self.base_lr_inv)
+        elif self.lr_parameterization == "mamba+":
+            lr = torch.nn.functional.sigmoid(lr.float()) * 0.1
         else:
             raise NotImplementedError(
                 f"LR parameterization {self.lr_parameterization} not implemented"
@@ -500,7 +554,11 @@ class LaCTSWIGLULayer(nn.Module):
         # Get learnable w-init regularization scalars for fast weights
         if self.w_reg_lrs == [None, None, None]:
             reg_lr = self.reg_lr_proj(hidden_states)  # [b, s, num_heads * lr_dim_per_head]
-            if self.lr_parameterization == "mamba":
+            if self.lr_parameterization == "gdn" or self.lr_parameterization == "gdn+" or self.lr_parameterization == "mamba+" or self.lr_parameterization == "mamba++" or self.lr_parameterization == "mamba+++":
+                reg_lr = torch.exp(-self.A_log.float().exp() * torch.nn.functional.softplus(reg_lr.float() + self.dt_bias))
+            elif self.lr_parameterization == "gdn2":
+                reg_lr = torch.sigmoid(reg_lr.float())
+            elif self.lr_parameterization == "mamba":
                 reg_lr = torch.nn.functional.softplus(reg_lr.float() + self.base_lr_inv)
             else:
                 raise NotImplementedError(
@@ -535,11 +593,12 @@ class LaCTSWIGLULayer(nn.Module):
         # Initialize the states of the fast weights
         fw_w0_norms, fw_w1_norms, fw_w2_norms, fw_w0_dists, fw_w1_dists, fw_w2_dists = None, None, None, None, None, None
 
+        if self.ablation and not self.rand_w1:
+            fw_w1 = fw_w1 * 0
         # [b * nh, s, d_ttt_head]
-        if self.ttt_prenorm:
-            # pre-norm version of ttt.   state = state + f(norm(state))
-            if use_fused_kernel:
-                fw_x = prenorm_block_causal_lact_swiglu_fused_kernel_triton(
+        if self.ablation:
+            if self.ablation2:
+                fw_x, fw_w0_norms, fw_w1_norms, fw_w2_norms, fw_w0_dists, fw_w1_dists, fw_w2_dists = block_causal_lact_swiglu2(
                     fw_w0,
                     fw_w1,
                     fw_w2,
@@ -552,9 +611,12 @@ class LaCTSWIGLULayer(nn.Module):
                     chunk_size=self.lact_chunk_size,
                     use_muon=self.use_muon,
                     momentum=momentum,
+                    w_reg_lrs=[fw_reg_lr1, fw_reg_lr2, fw_reg_lr3],
+                    clip_grad_norm=self.clip_grad_norm,
+                    return_states=self.track_states,
                 )
             else:
-                fw_x, fw_w0_norms, fw_w1_norms, fw_w2_norms, fw_w0_dists, fw_w1_dists, fw_w2_dists = prenorm_block_causal_lact_swiglu(
+                fw_x, fw_w0_norms, fw_w1_norms, fw_w2_norms, fw_w0_dists, fw_w1_dists, fw_w2_dists = block_causal_lact_swiglu_ablate(
                     fw_w0,
                     fw_w1,
                     fw_w2,
@@ -564,56 +626,99 @@ class LaCTSWIGLULayer(nn.Module):
                     fw_lr1,
                     fw_lr2,
                     fw_lr3,
-                    chunk_size=self.lact_chunk_size,
-                    use_muon=self.use_muon,
-                    momentum=momentum,
-                    ttt_loss_type=self.ttt_loss_type,
-                    w_inits=[fw_w0, fw_w1, fw_w2],
                     w_reg_lrs=[fw_reg_lr1, fw_reg_lr2, fw_reg_lr3],
-                    w_reg_mode=self.w_reg_mode,
-                    linearize=self.linearize_ttt,
-                    remove_norm=self.remove_norm,
+                    chunk_size=self.lact_chunk_size,
+                    ttt_loss_type=self.ttt_loss_type,
+                    fwd_mode=self.fwd_mode,
+                    update_then_apply=self.update_then_apply,
+                    normalize=self.normalize,
+                    scale=self.scale,
+                    weight_norm=self.weight_norm,
+                    mean_reg_lr=self.mean_reg_lr,
+                    no_reg_lr=self.no_reg_lr,
+                    clip_grad_norm=self.clip_grad_norm,
+                    rand_w1=self.rand_w1,
                     return_states=self.track_states,
                 )
         else:
-            # post-norm version of ttt.   state = norm(state + f(state))
-            if use_fused_kernel:
-                fw_x = postnorm_block_causal_lact_swiglu_fused_kernel_triton(
-                    fw_w0,
-                    fw_w1,
-                    fw_w2,
-                    fast_q,
-                    fast_k,
-                    fast_v,
-                    fw_lr1,
-                    fw_lr2,
-                    fw_lr3,
-                    chunk_size=self.lact_chunk_size,
-                    use_muon=self.use_muon,
-                    momentum=momentum,
-                )
+            if self.ttt_prenorm:
+                # pre-norm version of ttt.   state = state + f(norm(state))
+                if use_fused_kernel:
+                    fw_x = prenorm_block_causal_lact_swiglu_fused_kernel_triton(
+                        fw_w0,
+                        fw_w1,
+                        fw_w2,
+                        fast_q,
+                        fast_k,
+                        fast_v,
+                        fw_lr1,
+                        fw_lr2,
+                        fw_lr3,
+                        chunk_size=self.lact_chunk_size,
+                        use_muon=self.use_muon,
+                        momentum=momentum,
+                    )
+                else:
+                    fw_x, fw_w0_norms, fw_w1_norms, fw_w2_norms, fw_w0_dists, fw_w1_dists, fw_w2_dists = prenorm_block_causal_lact_swiglu(
+                        fw_w0,
+                        fw_w1,
+                        fw_w2,
+                        fast_q,
+                        fast_k,
+                        fast_v,
+                        fw_lr1,
+                        fw_lr2,
+                        fw_lr3,
+                        chunk_size=self.lact_chunk_size,
+                        use_muon=self.use_muon,
+                        momentum=momentum,
+                        ttt_loss_type=self.ttt_loss_type,
+                        w_inits=[fw_w0, fw_w1, fw_w2],
+                        w_reg_lrs=[fw_reg_lr1, fw_reg_lr2, fw_reg_lr3],
+                        w_reg_mode=self.w_reg_mode,
+                        linearize=self.linearize_ttt,
+                        remove_norm=self.remove_norm,
+                        return_states=self.track_states,
+                    )
             else:
-                fw_x, fw_w0_norms, fw_w1_norms, fw_w2_norms, fw_w0_dists, fw_w1_dists, fw_w2_dists = block_causal_lact_swiglu(
-                    fw_w0,
-                    fw_w1,
-                    fw_w2,
-                    fast_q,
-                    fast_k,
-                    fast_v,
-                    fw_lr1,
-                    fw_lr2,
-                    fw_lr3,
-                    chunk_size=self.lact_chunk_size,
-                    use_muon=self.use_muon,
-                    momentum=momentum,
-                    ttt_loss_type=self.ttt_loss_type,
-                    w_inits=[fw_w0, fw_w1, fw_w2],
-                    w_reg_lrs=[fw_reg_lr1, fw_reg_lr2, fw_reg_lr3],
-                    w_reg_mode=self.w_reg_mode,
-                    linearize=self.linearize_ttt,
-                    remove_norm=self.remove_norm,
-                    return_states=self.track_states,
-                )
+                # post-norm version of ttt.   state = norm(state + f(state))
+                if use_fused_kernel:
+                    fw_x = postnorm_block_causal_lact_swiglu_fused_kernel_triton(
+                        fw_w0,
+                        fw_w1,
+                        fw_w2,
+                        fast_q,
+                        fast_k,
+                        fast_v,
+                        fw_lr1,
+                        fw_lr2,
+                        fw_lr3,
+                        chunk_size=self.lact_chunk_size,
+                        use_muon=self.use_muon,
+                        momentum=momentum,
+                    )
+                else:
+                    fw_x, fw_w0_norms, fw_w1_norms, fw_w2_norms, fw_w0_dists, fw_w1_dists, fw_w2_dists = block_causal_lact_swiglu(
+                        fw_w0,
+                        fw_w1,
+                        fw_w2,
+                        fast_q,
+                        fast_k,
+                        fast_v,
+                        fw_lr1,
+                        fw_lr2,
+                        fw_lr3,
+                        chunk_size=self.lact_chunk_size,
+                        use_muon=self.use_muon,
+                        momentum=momentum,
+                        ttt_loss_type=self.ttt_loss_type,
+                        w_inits=[fw_w0, fw_w1, fw_w2],
+                        w_reg_lrs=[fw_reg_lr1, fw_reg_lr2, fw_reg_lr3],
+                        w_reg_mode=self.w_reg_mode,
+                        linearize=self.linearize_ttt,
+                        remove_norm=self.remove_norm,
+                        return_states=self.track_states,
+                    )
 
         # Track the states of the fast weights
         if self.track_states:
@@ -642,7 +747,7 @@ class LaCTSWIGLULayer(nn.Module):
             ttt_x_normed, "(b n_h) s d -> b s (n_h d)", n_h=self.num_fw_heads
         )
 
-        o = o + ttt_x_normed
+        o = o + ttt_x_normed if not self.ablation else ttt_x_normed
         o = self.o_proj(o)
 
         if not output_attentions:

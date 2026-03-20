@@ -75,6 +75,17 @@ class LaCTBlock(nn.Module):
             linearize_ttt=config.linearize_ttt,
             remove_norm=config.remove_norm,
             track_states=config.track_states,
+            ablation=config.ablation,
+            ablation2=config.ablation2,
+            fwd_mode=config.fwd_mode,
+            update_then_apply=config.update_then_apply,
+            normalize=config.normalize,
+            scale=config.scale,
+            weight_norm=config.weight_norm,
+            mean_reg_lr=config.mean_reg_lr,
+            no_reg_lr=config.no_reg_lr,
+            clip_grad_norm=config.clip_grad_norm,
+            rand_w1=config.rand_w1,
         )
 
         self.mlp_norm = (RMSNorm if config.fuse_norm else nn.RMSNorm)(
